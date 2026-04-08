@@ -164,6 +164,12 @@ def handle_exec(args: list[str], *, full_mode: bool) -> int:
 
     if args[0] == "resume":
         root_flags, resume_args = hoist_resume_root_flags(args[1:])
+        if "--last" in resume_args and not sys.stdin.isatty():
+            sys.stderr.write(
+                'cx: --last is not allowed in non-interactive mode. '
+                'Use an explicit session ID: cx resume SESSION_ID "prompt"\n'
+            )
+            return 2
         cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
         if full_mode:
             cmd.extend(root_flags)
