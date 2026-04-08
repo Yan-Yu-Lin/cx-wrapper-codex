@@ -1,0 +1,472 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+
+SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+ROOT_FLAGS_WITH_VALUE = {
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-s",
+    "--sandbox",
+    "-p",
+    "--profile",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "--output-schema",
+    "--color",
+}
+ROOT_FLAGS_NO_VALUE = {
+    "--oss",
+    "--full-auto",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "--json",
+    "--experimental-json",
+}
+RESERVED_CLEAN_FLAGS = {"--json", "--experimental-json", "-o", "--output-last-message"}
+
+
+@dataclass
+class SessionMessage:
+    role: str
+    text: str
+    phase: str | None = None
+
+
+@dataclass
+class SessionTranscript:
+    session_id: str | None
+    cwd: str | None
+    model: str | None
+    path: Path
+    messages: list[SessionMessage]
+
+
+@dataclass
+class ExecJsonResult:
+    thread_id: str | None = None
+    turn_completed: bool = False
+    turn_failed: bool = False
+    error_message: str | None = None
+    parse_error: str | None = None
+
+
+def print_help() -> int:
+    sys.stdout.write(
+        "Usage:\n"
+        "  cx [--full] [codex exec args...] PROMPT\n"
+        "  cx [--full] resume [codex exec resume args...]\n"
+        "  cx show --last\n"
+        "  cx show SESSION_ID\n"
+        "\n"
+        "Notes:\n"
+        "  --full          Raw passthrough to `codex exec --full-auto`\n"
+        "  show            Parse local session JSONL files; does not contact Codex\n"
+        "  All other args  Passed through to `codex exec`\n"
+    )
+    return 0
+
+
+def print_show_help() -> int:
+    sys.stdout.write(
+        "Usage:\n"
+        "  cx show --last\n"
+        "  cx show SESSION_ID\n"
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv == ["--help"] or argv == ["-h"]:
+        return print_help()
+
+    full_mode = False
+    filtered_args: list[str] = []
+    for arg in argv:
+        if arg == "--full":
+            full_mode = True
+        else:
+            filtered_args.append(arg)
+
+    if not filtered_args:
+        return print_help()
+
+    command = filtered_args[0]
+    if command == "show":
+        return handle_show(filtered_args[1:])
+
+    if command == "resume":
+        return handle_exec(filtered_args, full_mode=full_mode)
+
+    return handle_exec(filtered_args, full_mode=full_mode)
+
+
+def handle_show(args: list[str]) -> int:
+    if not args or args == ["--help"] or args == ["-h"]:
+        return print_show_help()
+
+    use_last = False
+    session_id: str | None = None
+
+    for arg in args:
+        if arg == "--last":
+            use_last = True
+        elif arg.startswith("-"):
+            sys.stderr.write(f"cx show: unsupported flag: {arg}\n")
+            return 2
+        elif session_id is None:
+            session_id = arg
+        else:
+            sys.stderr.write("cx show: expected exactly one SESSION_ID or --last\n")
+            return 2
+
+    if use_last and session_id is not None:
+        sys.stderr.write("cx show: use either --last or SESSION_ID, not both\n")
+        return 2
+
+    target = latest_session_file() if use_last else find_session_file_by_id(session_id)
+    if target is None:
+        detail = "most recent session" if use_last else f"session {session_id}"
+        sys.stderr.write(f"cx show: could not find {detail}\n")
+        return 1
+
+    transcript = parse_session_transcript(target)
+    render_transcript(transcript)
+    return 0
+
+
+def handle_exec(args: list[str], *, full_mode: bool) -> int:
+    if not full_mode and find_reserved_clean_flags(args):
+        flags = ", ".join(sorted(find_reserved_clean_flags(args)))
+        sys.stderr.write(
+            f"cx: {flags} are reserved in clean mode; use `cx --full ...` for raw codex flags\n"
+        )
+        return 2
+
+    if args[0] == "resume":
+        root_flags, resume_args = hoist_resume_root_flags(args[1:])
+        cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
+        if full_mode:
+            cmd.extend(root_flags)
+            cmd.append("resume")
+            cmd.extend(resume_args)
+            return run_full_mode(cmd)
+
+        return run_clean_mode(
+            ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json", *root_flags],
+            ["resume", *resume_args],
+        )
+
+    cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check", *args]
+    if full_mode:
+        return run_full_mode(cmd)
+    return run_clean_mode(["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json"], args)
+
+
+def run_full_mode(cmd: list[str]) -> int:
+    completed = subprocess.run(cmd)
+    return completed.returncode
+
+
+def run_clean_mode(base_cmd: list[str], tail_args: list[str]) -> int:
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="cx-", suffix=".md", delete=False) as handle:
+            temp_path = Path(handle.name)
+
+        cmd = [*base_cmd, "-o", str(temp_path), *tail_args]
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        json_result = parse_exec_json(completed.stdout)
+        last_message = read_last_message(temp_path)
+
+        if json_result.turn_completed and completed.returncode == 0:
+            emit_clean_success(last_message, json_result.thread_id)
+            return 0
+
+        error_text = json_result.error_message or first_nonempty_line(completed.stderr)
+        if not error_text and json_result.parse_error:
+            error_text = json_result.parse_error
+        if not error_text and completed.returncode != 0:
+            error_text = f"codex exited with status {completed.returncode}"
+        if not error_text and not json_result.turn_completed:
+            error_text = "codex did not emit turn.completed"
+
+        sys.stderr.write(f"cx: {error_text}\n")
+        return completed.returncode or 1
+    except FileNotFoundError:
+        sys.stderr.write("cx: `codex` not found on PATH\n")
+        return 127
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def parse_exec_json(stdout_text: str) -> ExecJsonResult:
+    result = ExecJsonResult()
+    for raw_line in stdout_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            result.parse_error = f"invalid JSON from codex exec: {exc}"
+            continue
+
+        event_type = payload.get("type")
+        if event_type == "thread.started" and not result.thread_id:
+            result.thread_id = payload.get("thread_id")
+        elif event_type == "turn.completed":
+            result.turn_completed = True
+        elif event_type == "turn.failed":
+            result.turn_failed = True
+            result.error_message = (
+                nested_get(payload, "error", "message")
+                or payload.get("message")
+                or "turn failed"
+            )
+        elif event_type == "error" and not result.error_message:
+            result.error_message = payload.get("message") or "event stream error"
+    return result
+
+
+def emit_clean_success(message: str, thread_id: str | None) -> None:
+    if message:
+        sys.stdout.write(message)
+        if not message.endswith("\n"):
+            sys.stdout.write("\n")
+    if thread_id:
+        if message:
+            sys.stdout.write("\n")
+        sys.stdout.write(f"Session: {thread_id}\n")
+
+
+def read_last_message(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def latest_session_file() -> Path | None:
+    candidates = list(iter_session_files())
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+
+
+def find_session_file_by_id(session_id: str | None) -> Path | None:
+    if not session_id:
+        return None
+    suffix = f"-{session_id}.jsonl"
+    matches = [path for path in iter_session_files() if path.name.endswith(suffix)]
+    if matches:
+        return max(matches, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+    return None
+
+
+def iter_session_files() -> Iterable[Path]:
+    if not SESSIONS_ROOT.is_dir():
+        return []
+    return SESSIONS_ROOT.rglob("*.jsonl")
+
+
+def parse_session_transcript(path: Path) -> SessionTranscript:
+    session_id: str | None = None
+    cwd: str | None = None
+    model: str | None = None
+    messages: list[SessionMessage] = []
+
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            entry_type = entry.get("type")
+            payload = entry.get("payload", {})
+
+            if entry_type == "session_meta":
+                session_id = payload.get("id") or session_id
+                cwd = payload.get("cwd") or cwd
+            elif entry_type == "turn_context":
+                model = payload.get("model") or model
+            elif entry_type == "response_item":
+                if payload.get("type") != "message" or payload.get("role") != "user":
+                    continue
+                text = extract_content_text(payload.get("content"))
+                if text and not text.lstrip().startswith("<"):
+                    messages.append(SessionMessage(role="user", text=text))
+            elif entry_type == "event_msg" and payload.get("type") == "agent_message":
+                text = extract_agent_message_text(payload)
+                if text:
+                    messages.append(
+                        SessionMessage(
+                            role="assistant",
+                            text=text,
+                            phase=payload.get("phase"),
+                        )
+                    )
+
+    return SessionTranscript(session_id=session_id, cwd=cwd, model=model, path=path, messages=messages)
+
+
+def render_transcript(transcript: SessionTranscript) -> None:
+    if transcript.session_id:
+        sys.stdout.write(f"Session: {transcript.session_id}\n")
+    if transcript.cwd:
+        sys.stdout.write(f"CWD: {transcript.cwd}\n")
+    if transcript.model:
+        sys.stdout.write(f"Model: {transcript.model}\n")
+    sys.stdout.write(f"File: {transcript.path}\n")
+
+    for message in transcript.messages:
+        if message.role == "user":
+            heading = "User"
+        elif message.phase and message.phase != "final_answer":
+            heading = f"Assistant [{message.phase}]"
+        else:
+            heading = "Assistant"
+        sys.stdout.write(f"\n{heading}:\n{message.text.rstrip()}\n")
+
+
+def extract_content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(part for part in parts if part).strip()
+
+
+def extract_agent_message_text(payload: dict[str, object]) -> str:
+    message = payload.get("message")
+    if isinstance(message, str):
+        return message
+
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    return extract_content_text(content)
+
+
+def hoist_resume_root_flags(args: list[str]) -> tuple[list[str], list[str]]:
+    hoisted: list[str] = []
+    remaining: list[str] = []
+    index = 0
+
+    while index < len(args):
+        token = args[index]
+
+        if token == "--":
+            remaining.extend(args[index:])
+            break
+
+        consumed = consume_root_flag(args, index)
+        if consumed is None:
+            remaining.append(token)
+            index += 1
+            continue
+
+        hoisted.extend(consumed)
+        index += len(consumed)
+
+    return hoisted, remaining
+
+
+def consume_root_flag(args: list[str], index: int) -> list[str] | None:
+    token = args[index]
+
+    if token in ROOT_FLAGS_NO_VALUE:
+        return [token]
+
+    if token in ROOT_FLAGS_WITH_VALUE:
+        if index + 1 >= len(args):
+            return [token]
+        return [token, args[index + 1]]
+
+    if token.startswith("--"):
+        name, sep, _value = token.partition("=")
+        if sep and name in ROOT_FLAGS_WITH_VALUE:
+            return [token]
+
+    return None
+
+
+def find_reserved_clean_flags(args: list[str]) -> set[str]:
+    found: set[str] = set()
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in RESERVED_CLEAN_FLAGS:
+            found.add(token)
+            if token in {"-o", "--output-last-message"} and index + 1 < len(args):
+                index += 2
+                continue
+        elif token.startswith("--output-last-message="):
+            found.add("--output-last-message")
+        index += 1
+    return found
+
+
+def nested_get(payload: dict[str, object], *keys: str) -> str | None:
+    value: object = payload
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value if isinstance(value, str) else None
+
+
+def first_nonempty_line(text: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
