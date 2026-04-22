@@ -70,6 +70,17 @@ class ExecJsonResult:
     parse_error: str | None = None
 
 
+@dataclass
+class SessionMeta:
+    cli_version: str | None = None
+    model: str | None = None
+    model_provider: str | None = None
+    cwd: str | None = None
+    effort: str | None = None
+    sandbox: str | None = None
+    approval: str | None = None
+
+
 def print_help() -> int:
     sys.stdout.write(
         "Usage:\n"
@@ -210,8 +221,14 @@ def run_clean_mode(base_cmd: list[str], tail_args: list[str]) -> int:
         json_result = parse_exec_json(completed.stdout)
         last_message = read_last_message(temp_path)
 
+        meta: SessionMeta | None = None
+        if json_result.thread_id:
+            session_file = find_session_file_by_id(json_result.thread_id)
+            if session_file:
+                meta = parse_session_meta(session_file)
+
         if json_result.turn_completed and completed.returncode == 0:
-            emit_clean_success(last_message, json_result.thread_id)
+            emit_clean_success(last_message, json_result.thread_id, meta)
             return 0
 
         error_text = json_result.error_message or first_nonempty_line(completed.stderr)
@@ -264,15 +281,36 @@ def parse_exec_json(stdout_text: str) -> ExecJsonResult:
     return result
 
 
-def emit_clean_success(message: str, thread_id: str | None) -> None:
+def emit_clean_success(message: str, thread_id: str | None, meta: SessionMeta | None = None) -> None:
+    if meta:
+        emit_meta_header(meta)
     if message:
         sys.stdout.write(message)
         if not message.endswith("\n"):
             sys.stdout.write("\n")
     if thread_id:
-        if message:
+        if message or meta:
             sys.stdout.write("\n")
         sys.stdout.write(f"Session: {thread_id}\n")
+
+
+def emit_meta_header(meta: SessionMeta) -> None:
+    version = f"OpenAI Codex v{meta.cli_version}" if meta.cli_version else "OpenAI Codex"
+    sys.stdout.write(f"{version}\n")
+    sys.stdout.write("--------\n")
+    if meta.cwd:
+        sys.stdout.write(f"workdir: {meta.cwd}\n")
+    if meta.model:
+        sys.stdout.write(f"model: {meta.model}\n")
+    if meta.model_provider:
+        sys.stdout.write(f"provider: {meta.model_provider}\n")
+    if meta.approval:
+        sys.stdout.write(f"approval: {meta.approval}\n")
+    if meta.sandbox:
+        sys.stdout.write(f"sandbox: {meta.sandbox}\n")
+    if meta.effort:
+        sys.stdout.write(f"reasoning effort: {meta.effort}\n")
+    sys.stdout.write("--------\n\n")
 
 
 def read_last_message(path: Path) -> str:
@@ -303,6 +341,46 @@ def iter_session_files() -> Iterable[Path]:
     if not SESSIONS_ROOT.is_dir():
         return []
     return SESSIONS_ROOT.rglob("*.jsonl")
+
+
+def parse_session_meta(path: Path) -> SessionMeta:
+    meta = SessionMeta()
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            entry_type = entry.get("type")
+            payload = entry.get("payload", {})
+
+            if entry_type == "session_meta":
+                meta.cli_version = payload.get("cli_version") or meta.cli_version
+                meta.cwd = payload.get("cwd") or meta.cwd
+                meta.model_provider = payload.get("model_provider") or meta.model_provider
+            elif entry_type == "turn_context":
+                meta.model = payload.get("model") or meta.model
+                meta.effort = payload.get("effort") or meta.effort
+                meta.approval = payload.get("approval_policy") or meta.approval
+                if payload.get("cwd"):
+                    meta.cwd = payload["cwd"]
+                sandbox = payload.get("sandbox_policy")
+                if isinstance(sandbox, dict):
+                    stype = sandbox.get("type") or sandbox.get("mode") or ""
+                    writable = sandbox.get("writable_roots", [])
+                    net = sandbox.get("network_access", False)
+                    parts = [stype]
+                    if writable:
+                        roots = ", ".join(str(r) for r in writable)
+                        parts.append(f"[{roots}]")
+                    if net:
+                        parts.append("(network access enabled)")
+                    meta.sandbox = " ".join(parts)
+    return meta
 
 
 def parse_session_transcript(path: Path) -> SessionTranscript:
