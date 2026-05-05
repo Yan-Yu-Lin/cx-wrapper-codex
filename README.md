@@ -21,6 +21,8 @@ chmod +x ~/.local/bin/cx
 
 ```bash
 cx "prompt"                              # Clean output: final message + session ID
+cx - < prompt.md                         # Safe long/multiline prompt via stdin
+cx --prompt-file prompt.md               # Safe long/multiline prompt via file
 cx --full "prompt"                       # Full codex exec passthrough (all noise)
 cx resume SESSION_ID "follow-up"         # Continue specific conversation
 cx resume --last "follow-up"             # Continue last conversation (interactive only)
@@ -39,6 +41,19 @@ cx -C /path/to/repo "fix the build"     # Different working directory
 cx -i screenshot.png "fix this UI bug"  # Attach image
 ```
 
+### Progress output
+
+Clean mode streams lightweight progress to stderr while Codex is running, then prints the final response to stdout when the turn completes. This keeps automation-friendly final output while avoiding long silent hangs. If Codex emits no events for 2 minutes, cx prints a single warning that it may be waiting on a tool or subprocess.
+
+```bash
+cx "prompt"                # Default: timestamped progress on stderr
+cx --quiet-progress "..."  # Only start/session/finish progress
+cx --no-progress "..."     # Disable progress output
+cx --debug-json "..."      # Echo raw codex JSONL events to stderr
+```
+
+For long prompts, prefer stdin or `--prompt-file` so shell quoting does not break on quotes, backslashes, dollar signs, or multiline text.
+
 ### Multi-turn conversations
 
 Use `resume` for back-and-forth with Codex. The session ID is printed after every response.
@@ -54,11 +69,11 @@ cx show 019d6dbe-b90f-...                          # Review full conversation
 
 ## How it works
 
-- **Clean mode (default):** Runs `codex exec --json -o tmpfile`, parses JSONL for session ID, reads tmpfile for final message, prints both, deletes tmpfile.
+- **Clean mode (default):** Runs `codex exec --json -o tmpfile`, streams lightweight progress from JSONL events to stderr, reads tmpfile for final message, prints final output + session ID to stdout, deletes tmpfile.
 - **Full mode (`--full`):** Raw passthrough to `codex exec`, no filtering.
 - **Show:** Parses session JSONL files from `~/.codex/sessions/` — purely local, no Codex call.
 
-The script always injects `--full-auto` and `--skip-git-repo-check` so it runs non-interactively.
+The script injects `-s workspace-write` and `--skip-git-repo-check` so it runs non-interactively with workspace-write sandboxing.
 
 ---
 
@@ -78,12 +93,14 @@ If you use [Claude Code](https://docs.anthropic.com/en/docs/claude-code), you ca
 
 When the user says "use Codex", "ask Codex", "delegate to Codex", or anything about calling Codex — use `cx`.
 
-Located at `~/.local/bin/cx`. Always runs non-interactively (`--full-auto --skip-git-repo-check` injected automatically).
+Located at `~/.local/bin/cx`. Always runs non-interactively (`-s workspace-write --skip-git-repo-check` injected automatically).
 
 ### Usage
 
 ```bash
 cx "prompt"                              # Clean output: final message + session ID
+cx - < prompt.md                         # Safe long/multiline prompt via stdin
+cx --prompt-file prompt.md               # Safe long/multiline prompt via file
 cx --full "prompt"                       # Full codex exec passthrough (all noise)
 cx resume --last "follow-up"             # Continue last conversation
 cx resume SESSION_ID "follow-up"         # Continue specific conversation
@@ -104,7 +121,7 @@ cx -i screenshot.png "fix this UI bug"  # Attach image
 
 ### How it works
 
-- **Clean mode (default)**: Runs `codex exec --json -o tmpfile`, parses JSONL for session ID, reads tmpfile for final message, prints both, deletes tmpfile.
+- **Clean mode (default)**: Runs `codex exec --json -o tmpfile`, streams lightweight progress from JSONL events to stderr, reads tmpfile for final message, prints final output + session ID to stdout, deletes tmpfile.
 - **Full mode (`--full`)**: Raw passthrough to `codex exec`, no filtering.
 - **Show**: Parses session JSONL files from `~/.codex/sessions/` — purely local, no Codex call.
 

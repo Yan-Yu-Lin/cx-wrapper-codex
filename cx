@@ -6,9 +6,13 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -35,7 +39,6 @@ ROOT_FLAGS_WITH_VALUE = {
 }
 ROOT_FLAGS_NO_VALUE = {
     "--oss",
-    "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
     "--skip-git-repo-check",
     "--ephemeral",
@@ -43,6 +46,35 @@ ROOT_FLAGS_NO_VALUE = {
     "--experimental-json",
 }
 RESERVED_CLEAN_FLAGS = {"--json", "--experimental-json", "-o", "--output-last-message"}
+POSITIONAL_FLAGS_WITH_VALUE = ROOT_FLAGS_WITH_VALUE | {
+    "-a",
+    "--ask-for-approval",
+    "-i",
+    "--image",
+}
+POSITIONAL_FLAGS_NO_VALUE = ROOT_FLAGS_NO_VALUE | {
+    "--all",
+    "--ignore-rules",
+    "--ignore-user-config",
+    "--last",
+    "--no-alt-screen",
+    "--search",
+}
+PROGRESS_WARNING_SECONDS = float(os.environ.get("CX_WARNING_SECONDS", "120"))
+
+
+@dataclass
+class WrapperOptions:
+    full_mode: bool = False
+    progress_mode: str = "normal"
+    prompt_file: Path | None = None
+
+
+@dataclass
+class PromptInput:
+    args: list[str]
+    stdin_text: str | None = None
+    summary: str | None = None
 
 
 @dataclass
@@ -71,6 +103,12 @@ class ExecJsonResult:
 
 
 @dataclass
+class ProgressState:
+    emitted_session: bool = False
+    emitted_meta: bool = False
+
+
+@dataclass
 class SessionMeta:
     cli_version: str | None = None
     model: str | None = None
@@ -85,12 +123,18 @@ def print_help() -> int:
     sys.stdout.write(
         "Usage:\n"
         "  cx [--full] [codex exec args...] PROMPT\n"
+        "  cx [--full] [codex exec args...] - < prompt.md\n"
+        "  cx [--prompt-file FILE] [codex exec args...]\n"
         "  cx [--full] resume [codex exec resume args...]\n"
         "  cx show --last\n"
         "  cx show SESSION_ID\n"
         "\n"
         "Notes:\n"
-        "  --full          Raw passthrough to `codex exec --full-auto`\n"
+        "  --full          Raw passthrough to `codex exec` (no clean formatting)\n"
+        "  --no-progress   Disable clean-mode progress output on stderr\n"
+        "  --quiet-progress Only show start/session/finish progress lines\n"
+        "  --debug-json    Echo codex JSONL events to stderr while still cleaning stdout\n"
+        "  --prompt-file   Read the prompt from a file and pass it through stdin\n"
         "  show            Parse local session JSONL files; does not contact Codex\n"
         "  All other args  Passed through to `codex exec`\n"
     )
@@ -110,25 +154,113 @@ def main(argv: list[str]) -> int:
     if not argv or argv == ["--help"] or argv == ["-h"]:
         return print_help()
 
-    full_mode = False
-    filtered_args: list[str] = []
-    for arg in argv:
-        if arg == "--full":
-            full_mode = True
-        else:
-            filtered_args.append(arg)
+    try:
+        options, filtered_args = parse_wrapper_args(argv)
+    except ValueError as exc:
+        sys.stderr.write(f"cx: {exc}\n")
+        return 2
 
-    if not filtered_args:
+    if not filtered_args and options.prompt_file is None:
+        return print_help()
+    if not options.full_mode and (filtered_args == ["--help"] or filtered_args == ["-h"]):
         return print_help()
 
-    command = filtered_args[0]
+    try:
+        prompt_input = prepare_prompt_input(filtered_args, options.prompt_file)
+    except OSError as exc:
+        sys.stderr.write(f"cx: {exc}\n")
+        return 2
+    except ValueError as exc:
+        sys.stderr.write(f"cx: {exc}\n")
+        return 2
+
+    command = prompt_input.args[0]
     if command == "show":
-        return handle_show(filtered_args[1:])
+        if options.prompt_file is not None:
+            sys.stderr.write("cx show: --prompt-file is only valid for codex exec commands\n")
+            return 2
+        return handle_show(prompt_input.args[1:])
 
     if command == "resume":
-        return handle_exec(filtered_args, full_mode=full_mode)
+        return handle_exec(prompt_input, options=options)
 
-    return handle_exec(filtered_args, full_mode=full_mode)
+    return handle_exec(prompt_input, options=options)
+
+
+def parse_wrapper_args(argv: list[str]) -> tuple[WrapperOptions, list[str]]:
+    options = WrapperOptions()
+    filtered_args: list[str] = []
+    index = 0
+
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            filtered_args.extend(argv[index:])
+            break
+        if arg == "--full":
+            options.full_mode = True
+        elif arg == "--no-progress":
+            options.progress_mode = "none"
+        elif arg == "--quiet-progress":
+            options.progress_mode = "quiet"
+        elif arg == "--debug-json":
+            options.progress_mode = "debug"
+        elif arg == "--prompt-file":
+            if index + 1 >= len(argv):
+                raise ValueError("--prompt-file requires a file path")
+            options.prompt_file = Path(argv[index + 1])
+            index += 1
+        elif arg.startswith("--prompt-file="):
+            _name, _sep, value = arg.partition("=")
+            if not value:
+                raise ValueError("--prompt-file requires a file path")
+            options.prompt_file = Path(value)
+        else:
+            filtered_args.append(arg)
+        index += 1
+
+    return options, filtered_args
+
+
+def prepare_prompt_input(args: list[str], prompt_file: Path | None) -> PromptInput:
+    if prompt_file is None:
+        return PromptInput(args=args, summary=summarize_prompt_args(args))
+
+    prompt_text = prompt_file.read_text(encoding="utf-8")
+    updated_args = list(args)
+
+    if not updated_args:
+        updated_args = ["-"]
+    elif updated_args[0] == "show":
+        return PromptInput(args=updated_args, stdin_text=prompt_text)
+    elif updated_args[0] == "resume":
+        ensure_prompt_file_can_be_added(updated_args[1:], command_name="resume")
+        if "-" not in positional_args(updated_args[1:]):
+            updated_args.append("-")
+    else:
+        ensure_prompt_file_can_be_added(updated_args, command_name="exec")
+        if "-" not in positional_args(updated_args):
+            updated_args.append("-")
+
+    return PromptInput(
+        args=updated_args,
+        stdin_text=prompt_text,
+        summary=summarize_prompt_text(prompt_text, source=str(prompt_file)),
+    )
+
+
+def ensure_prompt_file_can_be_added(args: list[str], *, command_name: str) -> None:
+    positional = positional_args(args)
+    if command_name == "resume":
+        if "--last" in args and positional and positional != ["-"]:
+            raise ValueError("--prompt-file cannot be combined with an explicit resume prompt")
+        if len(positional) <= 1 or (len(positional) == 2 and positional[-1] == "-"):
+            return
+        raise ValueError("--prompt-file cannot be combined with an explicit resume prompt")
+
+    if not positional or positional == ["-"]:
+        return
+    raise ValueError("--prompt-file cannot be combined with an explicit prompt argument")
 
 
 def handle_show(args: list[str]) -> int:
@@ -165,8 +297,10 @@ def handle_show(args: list[str]) -> int:
     return 0
 
 
-def handle_exec(args: list[str], *, full_mode: bool) -> int:
-    if not full_mode and find_reserved_clean_flags(args):
+def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
+    args = prompt_input.args
+
+    if not options.full_mode and find_reserved_clean_flags(args):
         flags = ", ".join(sorted(find_reserved_clean_flags(args)))
         sys.stderr.write(
             f"cx: {flags} are reserved in clean mode; use `cx --full ...` for raw codex flags\n"
@@ -181,44 +315,118 @@ def handle_exec(args: list[str], *, full_mode: bool) -> int:
                 'Use an explicit session ID: cx resume SESSION_ID "prompt"\n'
             )
             return 2
-        cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check"]
-        if full_mode:
+        cmd = ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check"]
+        if options.full_mode:
             cmd.extend(root_flags)
             cmd.append("resume")
             cmd.extend(resume_args)
-            return run_full_mode(cmd)
+            return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
 
         return run_clean_mode(
-            ["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json", *root_flags],
+            ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "--json", *root_flags],
             ["resume", *resume_args],
+            options=options,
+            prompt_summary=prompt_input.summary,
+            stdin_text=prompt_input.stdin_text,
         )
 
-    cmd = ["codex", "exec", "--full-auto", "--skip-git-repo-check", *args]
-    if full_mode:
-        return run_full_mode(cmd)
-    return run_clean_mode(["codex", "exec", "--full-auto", "--skip-git-repo-check", "--json"], args)
+    cmd = ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", *args]
+    if options.full_mode:
+        return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
+    return run_clean_mode(
+        ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "--json"],
+        args,
+        options=options,
+        prompt_summary=prompt_input.summary,
+        stdin_text=prompt_input.stdin_text,
+    )
 
 
-def run_full_mode(cmd: list[str]) -> int:
-    completed = subprocess.run(cmd)
+def run_full_mode(cmd: list[str], *, stdin_text: str | None = None) -> int:
+    completed = subprocess.run(cmd, input=stdin_text, text=stdin_text is not None)
     return completed.returncode
 
 
-def run_clean_mode(base_cmd: list[str], tail_args: list[str]) -> int:
+def run_clean_mode(
+    base_cmd: list[str],
+    tail_args: list[str],
+    *,
+    options: WrapperOptions,
+    prompt_summary: str | None,
+    stdin_text: str | None = None,
+) -> int:
     temp_path: Path | None = None
+    stderr_lines: list[str] = []
+    stderr_queue: queue.Queue[str] = queue.Queue()
+    stdout_queue: queue.Queue[str] = queue.Queue()
+    process: subprocess.Popen[str] | None = None
+    stdin_thread: threading.Thread | None = None
     try:
         with tempfile.NamedTemporaryFile(prefix="cx-", suffix=".md", delete=False) as handle:
             temp_path = Path(handle.name)
 
         cmd = [*base_cmd, "-o", str(temp_path), *tail_args]
-        completed = subprocess.run(
+        progress = ProgressReporter(options.progress_mode, prompt_summary)
+        progress.start()
+
+        process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             text=True,
             encoding="utf-8",
+            bufsize=1,
         )
-        json_result = parse_exec_json(completed.stdout)
+
+        stdout_thread = threading.Thread(
+            target=enqueue_stream_lines,
+            args=(process.stdout, stdout_queue),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=enqueue_stream_lines,
+            args=(process.stderr, stderr_queue),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        if stdin_text is not None and process.stdin is not None:
+            stdin_thread = threading.Thread(
+                target=write_process_stdin,
+                args=(process.stdin, stdin_text),
+                daemon=True,
+            )
+            stdin_thread.start()
+
+        json_result = ExecJsonResult()
+        state = ProgressState()
+
+        while (
+            process.poll() is None
+            or stdout_thread.is_alive()
+            or stderr_thread.is_alive()
+            or not stdout_queue.empty()
+            or not stderr_queue.empty()
+        ):
+            drain_stderr_queue(stderr_queue, stderr_lines)
+            try:
+                raw_line = stdout_queue.get(timeout=1)
+            except queue.Empty:
+                progress.heartbeat()
+                continue
+
+            update_exec_json_from_line(raw_line, json_result)
+            progress.event(raw_line, json_result, state)
+
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=1)
+        drain_stderr_queue(stderr_queue, stderr_lines)
+
+        completed_returncode = process.wait()
         last_message = read_last_message(temp_path)
 
         meta: SessionMeta | None = None
@@ -227,24 +435,28 @@ def run_clean_mode(base_cmd: list[str], tail_args: list[str]) -> int:
             if session_file:
                 meta = parse_session_meta(session_file)
 
-        if json_result.turn_completed and completed.returncode == 0:
+        if json_result.turn_completed and completed_returncode == 0:
+            progress.finish(success=True)
             emit_clean_success(last_message, json_result.thread_id, meta)
             return 0
 
-        error_text = json_result.error_message or first_nonempty_line(completed.stderr)
+        error_text = json_result.error_message or first_relevant_error_line("".join(stderr_lines))
         if not error_text and json_result.parse_error:
             error_text = json_result.parse_error
-        if not error_text and completed.returncode != 0:
-            error_text = f"codex exited with status {completed.returncode}"
+        if not error_text and completed_returncode != 0:
+            error_text = f"codex exited with status {completed_returncode}"
         if not error_text and not json_result.turn_completed:
             error_text = "codex did not emit turn.completed"
 
+        progress.finish(success=False)
         sys.stderr.write(f"cx: {error_text}\n")
-        return completed.returncode or 1
+        return completed_returncode or 1
     except FileNotFoundError:
         sys.stderr.write("cx: `codex` not found on PATH\n")
         return 127
     finally:
+        if process is not None and process.poll() is None:
+            process.kill()
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -252,33 +464,259 @@ def run_clean_mode(base_cmd: list[str], tail_args: list[str]) -> int:
                 pass
 
 
+class ProgressReporter:
+    def __init__(self, mode: str, prompt_summary: str | None) -> None:
+        self.mode = mode
+        self.prompt_summary = prompt_summary
+        self.last_activity_at = time.monotonic()
+        self.last_event_line_at = 0.0
+        self.warned_after_silence = False
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "none"
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self.emit("starting codex exec")
+        if self.prompt_summary and self.mode != "quiet":
+            self.emit(self.prompt_summary)
+
+    def event(self, raw_line: str, result: ExecJsonResult, state: ProgressState) -> None:
+        self.last_activity_at = time.monotonic()
+        self.warned_after_silence = False
+        if not self.enabled:
+            return
+
+        line = raw_line.strip()
+        if not line:
+            return
+
+        if self.mode == "debug":
+            self.emit(f"json: {line}")
+
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        event_type = payload.get("type")
+        if event_type == "thread.started" and not state.emitted_session:
+            thread_id = payload.get("thread_id") or result.thread_id
+            if thread_id:
+                self.emit(f"session: {thread_id}")
+                state.emitted_session = True
+
+        if result.thread_id and not state.emitted_meta and self.mode != "quiet":
+            if self.emit_meta_if_available(result.thread_id):
+                state.emitted_meta = True
+
+        if self.mode == "quiet":
+            return
+
+        if event_type == "turn.started":
+            self.emit("turn started")
+        elif event_type == "turn.completed":
+            self.emit("turn completed")
+        elif event_type == "turn.failed":
+            self.emit("turn failed")
+        elif event_type != "thread.started":
+            self.emit_rate_limited_event(event_type)
+
+    def heartbeat(self) -> None:
+        if not self.enabled or self.mode == "quiet":
+            return
+        now = time.monotonic()
+        silent_for = now - self.last_activity_at
+        if silent_for < PROGRESS_WARNING_SECONDS:
+            return
+        if self.warned_after_silence:
+            return
+        self.emit(
+            f"Warning: no Codex events for {format_duration(silent_for)}; "
+            "Codex may be waiting on a tool/subprocess"
+        )
+        self.warned_after_silence = True
+
+    def finish(self, *, success: bool) -> None:
+        if self.enabled:
+            self.emit("finished" if success else "finished with error")
+
+    def emit_rate_limited_event(self, event_type: object) -> None:
+        if not isinstance(event_type, str):
+            return
+        now = time.monotonic()
+        if now - self.last_event_line_at < 5:
+            return
+        self.emit(f"event: {event_type}")
+        self.last_event_line_at = now
+
+    def emit_meta_if_available(self, thread_id: str) -> bool:
+        session_file = find_session_file_by_id(thread_id)
+        if not session_file:
+            return False
+
+        meta = parse_session_meta(session_file)
+        lines: list[str] = []
+        if meta.cli_version:
+            lines.append(f"codex: {meta.cli_version}")
+        if meta.cwd:
+            lines.append(f"workdir: {meta.cwd}")
+        if meta.model:
+            lines.append(f"model: {meta.model}")
+        if meta.model_provider:
+            lines.append(f"provider: {meta.model_provider}")
+        if meta.approval:
+            lines.append(f"approval: {meta.approval}")
+        if meta.sandbox:
+            lines.append(f"sandbox: {meta.sandbox}")
+        if meta.effort:
+            lines.append(f"reasoning effort: {meta.effort}")
+
+        if not lines:
+            return False
+
+        for line in lines:
+            self.emit(line)
+        return True
+
+    def emit(self, message: str) -> None:
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] cx: {message}\n")
+        sys.stderr.flush()
+
+
+def enqueue_stream_lines(stream: object, output_queue: queue.Queue[str]) -> None:
+    if stream is None:
+        return
+    for line in stream:
+        output_queue.put(line)
+
+
+def write_process_stdin(stream: object, text: str) -> None:
+    try:
+        stream.write(text)
+        if not text.endswith("\n"):
+            stream.write("\n")
+        stream.flush()
+    finally:
+        stream.close()
+
+
+def drain_stderr_queue(stderr_queue: queue.Queue[str], stderr_lines: list[str]) -> None:
+    while True:
+        try:
+            stderr_lines.append(stderr_queue.get_nowait())
+        except queue.Empty:
+            return
+
+
+def summarize_prompt_args(args: list[str]) -> str | None:
+    if not args or args[0] == "show":
+        return None
+
+    if args[0] == "resume":
+        positional = positional_args(args[1:])
+        if "-" in positional:
+            return "input: stdin prompt (-)"
+        if "--last" in args and positional:
+            return summarize_prompt_text(positional[-1], source="argument")
+        if len(positional) >= 2:
+            return summarize_prompt_text(positional[-1], source="argument")
+        return None
+
+    positional = positional_args(args)
+    if "-" in positional:
+        return "input: stdin prompt (-)"
+    if positional:
+        return summarize_prompt_text(positional[-1], source="argument")
+    return None
+
+
+def summarize_prompt_text(text: str, *, source: str) -> str:
+    line_count = len(text.splitlines()) or (1 if text else 0)
+    preview = first_nonempty_line(text) or ""
+    preview = preview.replace("\t", " ")
+    if len(preview) > 120:
+        preview = f"{preview[:117]}..."
+    if preview:
+        return f"input: {source}, {len(text)} chars, {line_count} lines, preview: {preview!r}"
+    return f"input: {source}, {len(text)} chars, {line_count} lines"
+
+
+def format_duration(seconds: float) -> str:
+    total = int(seconds)
+    minutes, remainder = divmod(total, 60)
+    if minutes:
+        return f"{minutes}m {remainder}s"
+    return f"{remainder}s"
+
+
+def positional_args(args: list[str]) -> list[str]:
+    positional: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+
+        if token == "--":
+            positional.extend(args[index + 1 :])
+            break
+
+        if token in POSITIONAL_FLAGS_NO_VALUE:
+            index += 1
+            continue
+
+        if token in POSITIONAL_FLAGS_WITH_VALUE:
+            index += 2 if index + 1 < len(args) else 1
+            continue
+
+        if token.startswith("--"):
+            name, sep, _value = token.partition("=")
+            if sep and name in POSITIONAL_FLAGS_WITH_VALUE:
+                index += 1
+                continue
+
+        if token.startswith("-") and token != "-":
+            index += 1
+            continue
+
+        positional.append(token)
+        index += 1
+
+    return positional
+
+
 def parse_exec_json(stdout_text: str) -> ExecJsonResult:
     result = ExecJsonResult()
     for raw_line in stdout_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as exc:
-            result.parse_error = f"invalid JSON from codex exec: {exc}"
-            continue
-
-        event_type = payload.get("type")
-        if event_type == "thread.started" and not result.thread_id:
-            result.thread_id = payload.get("thread_id")
-        elif event_type == "turn.completed":
-            result.turn_completed = True
-        elif event_type == "turn.failed":
-            result.turn_failed = True
-            result.error_message = (
-                nested_get(payload, "error", "message")
-                or payload.get("message")
-                or "turn failed"
-            )
-        elif event_type == "error" and not result.error_message:
-            result.error_message = payload.get("message") or "event stream error"
+        update_exec_json_from_line(raw_line, result)
     return result
+
+
+def update_exec_json_from_line(raw_line: str, result: ExecJsonResult) -> None:
+    line = raw_line.strip()
+    if not line:
+        return
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError as exc:
+        result.parse_error = f"invalid JSON from codex exec: {exc}"
+        return
+
+    event_type = payload.get("type")
+    if event_type == "thread.started" and not result.thread_id:
+        result.thread_id = payload.get("thread_id")
+    elif event_type == "turn.completed":
+        result.turn_completed = True
+    elif event_type == "turn.failed":
+        result.turn_failed = True
+        result.error_message = (
+            nested_get(payload, "error", "message")
+            or payload.get("message")
+            or "turn failed"
+        )
+    elif event_type == "error" and not result.error_message:
+        result.error_message = payload.get("message") or "event stream error"
 
 
 def emit_clean_success(message: str, thread_id: str | None, meta: SessionMeta | None = None) -> None:
@@ -549,6 +987,21 @@ def first_nonempty_line(text: str) -> str | None:
         stripped = line.strip()
         if stripped:
             return stripped
+    return None
+
+
+def first_relevant_error_line(text: str) -> str | None:
+    ignored_prefixes = (
+        "Reading additional input from stdin",
+        "WARNING: proceeding, even though we could not update PATH:",
+    )
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(ignored_prefixes):
+            continue
+        return stripped
     return None
 
 
