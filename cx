@@ -297,6 +297,17 @@ def handle_show(args: list[str]) -> int:
     return 0
 
 
+def sandbox_base_flags(args: list[str]) -> list[str]:
+    """Keep the default unless the caller explicitly selects a sandbox."""
+    selected = any(
+        a in ("-s", "--sandbox", "--dangerously-bypass-approvals-and-sandbox")
+        or a.startswith("--sandbox=")
+        or (a.startswith("-s") and not a.startswith("--") and len(a) > 2)
+        for a in args
+    )
+    return [] if selected else ["-s", "workspace-write"]
+
+
 def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
     args = prompt_input.args
 
@@ -315,7 +326,8 @@ def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
                 'Use an explicit session ID: cx resume SESSION_ID "prompt"\n'
             )
             return 2
-        cmd = ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check"]
+        sandbox_flags = sandbox_base_flags([*root_flags, *resume_args])
+        cmd = ["codex", "exec", *sandbox_flags, "--skip-git-repo-check"]
         if options.full_mode:
             cmd.extend(root_flags)
             cmd.append("resume")
@@ -323,18 +335,19 @@ def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
             return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
 
         return run_clean_mode(
-            ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "--json", *root_flags],
+            ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", "--json", *root_flags],
             ["resume", *resume_args],
             options=options,
             prompt_summary=prompt_input.summary,
             stdin_text=prompt_input.stdin_text,
         )
 
-    cmd = ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", *args]
+    sandbox_flags = sandbox_base_flags(args)
+    cmd = ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", *args]
     if options.full_mode:
         return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
     return run_clean_mode(
-        ["codex", "exec", "-s", "workspace-write", "--skip-git-repo-check", "--json"],
+        ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", "--json"],
         args,
         options=options,
         prompt_summary=prompt_input.summary,
@@ -851,6 +864,14 @@ def parse_session_transcript(path: Path) -> SessionTranscript:
                 text = extract_content_text(payload.get("content"))
                 if text and not text.lstrip().startswith("<"):
                     messages.append(SessionMessage(role="user", text=text))
+            elif entry_type == "event_msg" and payload.get("type") == "item_completed":
+                item = payload.get("item", {})
+                if item.get("type") == "AgentMessage":
+                    text = extract_agent_message_text(item)
+                    if text:
+                        messages.append(
+                            SessionMessage(role="assistant", text=text, phase=item.get("phase"))
+                        )
             elif entry_type == "event_msg" and payload.get("type") == "agent_message":
                 text = extract_agent_message_text(payload)
                 if text:
