@@ -73,7 +73,7 @@ cx show 019d6dbe-b90f-...                          # Review full conversation
 - **Full mode (`--full`):** Raw passthrough to `codex exec`, no filtering.
 - **Show:** Parses session JSONL files from `~/.codex/sessions/` — purely local, no Codex call.
 
-The script injects `-s workspace-write` and `--skip-git-repo-check` so it runs non-interactively with workspace-write sandboxing.
+The script injects `-s danger-full-access` and `--skip-git-repo-check` so it runs non-interactively with the sandbox disabled (override with `--sandbox`).
 
 ---
 

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-CODEX_PINNED_VERSION = "0.153.1"
+CODEX_PINNED_VERSION = "0.162.1"
 CODEX_CMD = ["npx", f"@openai/codex@{CODEX_PINNED_VERSION}"]
 
 
