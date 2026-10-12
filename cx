@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+CODEX_PINNED_VERSION = "0.153.1"
+CODEX_CMD = ["npx", f"@openai/codex@{CODEX_PINNED_VERSION}"]
+
 
 SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 ROOT_FLAGS_WITH_VALUE = {
@@ -305,7 +308,7 @@ def sandbox_base_flags(args: list[str]) -> list[str]:
         or (a.startswith("-s") and not a.startswith("--") and len(a) > 2)
         for a in args
     )
-    return [] if selected else ["-s", "workspace-write"]
+    return [] if selected else ["-s", "danger-full-access"]
 
 
 def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
@@ -327,7 +330,7 @@ def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
             )
             return 2
         sandbox_flags = sandbox_base_flags([*root_flags, *resume_args])
-        cmd = ["codex", "exec", *sandbox_flags, "--skip-git-repo-check"]
+        cmd = [*CODEX_CMD, "exec", *sandbox_flags, "--skip-git-repo-check"]
         if options.full_mode:
             cmd.extend(root_flags)
             cmd.append("resume")
@@ -335,7 +338,7 @@ def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
             return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
 
         return run_clean_mode(
-            ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", "--json", *root_flags],
+            [*CODEX_CMD, "exec", *sandbox_flags, "--skip-git-repo-check", "--json", *root_flags],
             ["resume", *resume_args],
             options=options,
             prompt_summary=prompt_input.summary,
@@ -343,11 +346,11 @@ def handle_exec(prompt_input: PromptInput, *, options: WrapperOptions) -> int:
         )
 
     sandbox_flags = sandbox_base_flags(args)
-    cmd = ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", *args]
+    cmd = [*CODEX_CMD, "exec", *sandbox_flags, "--skip-git-repo-check", *args]
     if options.full_mode:
         return run_full_mode(cmd, stdin_text=prompt_input.stdin_text)
     return run_clean_mode(
-        ["codex", "exec", *sandbox_flags, "--skip-git-repo-check", "--json"],
+        [*CODEX_CMD, "exec", *sandbox_flags, "--skip-git-repo-check", "--json"],
         args,
         options=options,
         prompt_summary=prompt_input.summary,
